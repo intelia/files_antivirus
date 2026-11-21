@@ -138,6 +138,64 @@ class BackgroundScannerTest extends TestBase {
 		$this->assertEquals([$newFileId], $outdated);
 	}
 
+	public function testGetUnscannedFilesIsOrdered() {
+		$this->markAllScanned();
+
+		$scanner = $this->getBackgroundScanner();
+		$ids = [];
+		for ($i = 0; $i < 5; $i++) {
+			$ids[] = $this->homeDirectory->newFile("ordered$i", 'bar')->getId();
+		}
+		sort($ids);
+
+		$this->assertEquals($ids, iterator_to_array($scanner->getUnscannedFiles()));
+		$this->assertEquals(array_slice($ids, 0, 2), iterator_to_array($scanner->getUnscannedFiles(2)));
+	}
+
+	public function testGetUnscannedFilesObjectStoreHome() {
+		$this->markAllScanned();
+
+		$storage = new TemporaryObjectHome();
+		$storage->mkdir('files');
+		$storage->mkdir('files_versions');
+		$storage->mkdir('files_trashbin');
+		$storage->file_put_contents('files/foo', 'bar');
+		$storage->file_put_contents('files_versions/foo.v1', 'bar');
+		$storage->file_put_contents('files_trashbin/foo.d1', 'bar');
+		$storage->getScanner()->scan('');
+
+		$scanner = $this->getBackgroundScanner();
+		$unscanned = iterator_to_array($scanner->getUnscannedFiles());
+		$this->assertEquals([$storage->getCache()->getId('files/foo')], $unscanned);
+	}
+
+	public function testUnreachableFilesDoNotBlockTheQueue() {
+		$this->markAllScanned();
+
+		// entries no user can reach, older than the user's new file
+		$orphan = new \OC\Files\Storage\Temporary();
+		for ($i = 0; $i < 3; $i++) {
+			$orphan->file_put_contents("orphan$i", 'bar');
+		}
+		$orphan->getScanner()->scan('');
+		$orphanIds = array_map(fn ($i) => $orphan->getCache()->getId("orphan$i"), range(0, 2));
+		// the storage scan assigns ids in directory listing order, not by name
+		sort($orphanIds);
+
+		$newFileId = $this->homeDirectory->newFile('foo', 'bar')->getId();
+
+		$scanner = $this->getBackgroundScanner();
+		$this->assertEquals([...$orphanIds, $newFileId], iterator_to_array($scanner->getUnscannedFiles()));
+
+		// a batch of 3 takes only the unreachable entries: none is scanned, all are recorded
+		$this->assertEquals(0, $scanner->scan(3));
+		$this->assertEquals([$newFileId], iterator_to_array($scanner->getUnscannedFiles()));
+
+		// so the next batch reaches the user's file
+		$this->assertEquals(1, $scanner->scan(3));
+		$this->assertEquals([], iterator_to_array($scanner->getUnscannedFiles()));
+	}
+
 	public function testGetOutdatedFiles() {
 		$newFileId = $this->homeDirectory->newFile('foo', 'bar')->getId();
 		$this->markAllScanned();

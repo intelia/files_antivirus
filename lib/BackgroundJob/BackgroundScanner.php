@@ -129,6 +129,13 @@ class BackgroundScanner extends TimedJob {
 					$this->scanOneFile($file);
 					// increased only for successfully scanned files
 					$count++;
+				} elseif ($file === null) {
+					// No user can reach this entry (no mount, or not in anyone's files):
+					// record it, so it is not picked again on every run and does not
+					// keep reachable files out of the batch. It is looked at again
+					// when it changes (getToRescanFiles) or once it is outdated.
+					$this->logger->info('Skipping file ' . $fileId . ' that is not in any user\'s files');
+					$this->markSkipped($fileId);
 				} else {
 					$this->logger->info('Tried to scan non file');
 					$this->deleteFileCheckTime($fileId);
@@ -144,8 +151,14 @@ class BackgroundScanner extends TimedJob {
 		$cachedMounts = $this->userMountCache->getMountsForFileId($fileId);
 
 		foreach ($cachedMounts as $cachedMount) {
-			$userFolder = $this->rootFolder->getUserFolder($cachedMount->getUser()->getUID());
-			$nodes = $userFolder->getById($fileId);
+			try {
+				$userFolder = $this->rootFolder->getUserFolder($cachedMount->getUser()->getUID());
+				$nodes = $userFolder->getById($fileId);
+			} catch (\Exception $e) {
+				// a mount of a user that is gone or cannot be set up: try the next one
+				$this->logger->debug('Could not look up file ' . $fileId . ' for a mount: ' . $e->getMessage(), ['exception' => $e]);
+				continue;
+			}
 			foreach ($nodes as $node) {
 				if ($node->isReadable()) {
 					return $node;
@@ -200,12 +213,18 @@ class BackgroundScanner extends TimedJob {
 			->andWhere($query->expr()->neq('mimetype', $query->createNamedParameter($dirMimeTypeId)))
 			->andWhere($query->expr()->orX(
 				$query->expr()->like('path', $query->createNamedParameter('files/%')),
-				$query->expr()->notLike('s.id', $query->createNamedParameter('home::%'))
+				$query->expr()->andX(
+					// home storages, on local disk or in a primary object store, are
+					// only scanned below files/ (not versions, trash, uploads or cache)
+					$query->expr()->notLike('s.id', $query->createNamedParameter('home::%')),
+					$query->expr()->notLike('s.id', $query->createNamedParameter('object::user:%')),
+				),
 			))
 			->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter("appdata_$instanceId/%")))
 			->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter("\_\_groupfolders/versions/%")))
 			->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter("\_\_groupfolders/trash/%")))
 			->andWhere($this->getSizeLimitExpression($query))
+			->orderBy('fc.fileid', 'ASC')
 			->setMaxResults($limit ?? ($this->getBatchSize() * 10));
 
 		$result = $query->executeQuery();
@@ -227,6 +246,7 @@ class BackgroundScanner extends TimedJob {
 			->join('fc', 'files_antivirus', 'fa', $qb->expr()->eq('fc.fileid', 'fa.fileid'))
 			->andWhere($qb->expr()->lt('fa.check_time', 'fc.mtime'))
 			->andWhere($this->getSizeLimitExpression($qb))
+			->orderBy('fc.fileid', 'ASC')
 			->setMaxResults($limit ?? ($this->getBatchSize() * 10));
 
 		$result = $qb->executeQuery();
@@ -262,6 +282,8 @@ class BackgroundScanner extends TimedJob {
 			->andWhere($query->expr()->like('path', $query->expr()->literal('files/%')))
 			->andWhere($query->expr()->lt('check_time', $query->createNamedParameter($yesterday)))
 			->andWhere($this->getSizeLimitExpression($query))
+			->orderBy('fa.check_time', 'ASC')
+			->addOrderBy('fc.fileid', 'ASC')
 			->setMaxResults($limit ?? ($this->getBatchSize() * 10));
 
 		$result = $query->executeQuery();
@@ -276,6 +298,20 @@ class BackgroundScanner extends TimedJob {
 			->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
 
 		$result = $query->executeStatement();
+	}
+
+	/**
+	 * Record a file that cannot be scanned as checked now, so it leaves the queue
+	 */
+	public function markSkipped(int $fileId): void {
+		$this->deleteFileCheckTime($fileId);
+		$query = $this->db->getQueryBuilder();
+		$query->insert('files_antivirus')
+			->values([
+				'fileid' => $query->createNamedParameter($fileId, IQueryBuilder::PARAM_INT),
+				'check_time' => $query->createNamedParameter($this->timeFactory->getTime(), IQueryBuilder::PARAM_INT),
+			]);
+		$query->executeStatement();
 	}
 
 	protected function scanOneFile(File $file): void {
